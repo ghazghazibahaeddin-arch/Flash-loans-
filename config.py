@@ -1,10 +1,15 @@
 """
 config.py
-Central configuration for the DEX arbitrage scanner.
+Central configuration for the multi-strategy DeFi opportunity engine.
 
-All tunables live here so nothing is hardcoded deep in the logic.
-Values can be overridden via environment variables or a local `config.yaml`
-(see `load_config()` at the bottom).
+All tunables live here so nothing is hardcoded deep in the scanning/
+scoring logic. Values can be overridden via environment variables or a
+local `config.yaml` (see `load_config()` at the bottom).
+
+This engine is READ-ONLY: it discovers, scores, and reports opportunities.
+It never holds a key, builds a transaction, or executes a trade. Acting on
+anything it reports is a separate, deliberate, manual step taken by the
+operator.
 """
 
 from __future__ import annotations
@@ -17,118 +22,160 @@ from typing import List, Dict, Optional
 
 
 # --------------------------------------------------------------------------
-# Network / RPC
+# Per-chain network config
 # --------------------------------------------------------------------------
+
+@dataclass
+class ChainConfig:
+    name: str
+    chain_id: Optional[int]           # None for non-EVM chains like Solana
+    rpc_url: str
+    ws_url: Optional[str] = None
+    subgraph_url: Optional[str] = None
+    enabled: bool = True
+    # Cheap chains are the whole point here — gas/fee assumptions differ
+    # a lot by chain, so each one carries its own fallback.
+    native_symbol: str = "ETH"
+    native_token_usd_fallback: float = 3_000.0
+    gas_price_fallback_gwei: float = 0.05
+
 
 @dataclass
 class NetworkConfig:
-    chain_name: str = "base"
-    chain_id: int = 8453
-    # Public/free RPC as a default fallback. In production, use a paid
-    # provider (Alchemy/Infura/QuickNode) — public RPCs rate-limit hard.
-    rpc_url: str = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
-    ws_url: Optional[str] = os.getenv("BASE_WS_URL", None)
-    subgraph_url: str = os.getenv(
-        "BASE_SUBGRAPH_URL",
-        # Placeholder — user should point this at a real Uniswap-on-Base
-        # subgraph deployment (e.g. via The Graph's hosted/decentralized
-        # network, or a self-hosted equivalent).
-        "https://api.thegraph.com/subgraphs/name/PLACEHOLDER/base-uniswap",
-    )
+    chains: Dict[str, ChainConfig] = field(default_factory=lambda: {
+        "base": ChainConfig(
+            name="base",
+            chain_id=8453,
+            rpc_url=os.getenv("BASE_RPC_URL", "https://mainnet.base.org"),
+            subgraph_url=os.getenv(
+                "BASE_SUBGRAPH_URL",
+                "https://api.thegraph.com/subgraphs/name/PLACEHOLDER/base-uniswap",
+            ),
+            native_symbol="ETH",
+            native_token_usd_fallback=3_000.0,
+            gas_price_fallback_gwei=0.05,
+        ),
+        "arbitrum": ChainConfig(
+            name="arbitrum",
+            chain_id=42161,
+            rpc_url=os.getenv("ARBITRUM_RPC_URL", "https://arb1.arbitrum.io/rpc"),
+            subgraph_url=os.getenv("ARBITRUM_SUBGRAPH_URL", "https://api.thegraph.com/subgraphs/name/PLACEHOLDER/arbitrum-uniswap"),
+            native_symbol="ETH",
+            native_token_usd_fallback=3_000.0,
+            gas_price_fallback_gwei=0.1,
+        ),
+        "solana": ChainConfig(
+            name="solana",
+            chain_id=None,
+            rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            subgraph_url=None,   # Solana indexers typically aren't subgraph-based
+            native_symbol="SOL",
+            native_token_usd_fallback=150.0,
+            gas_price_fallback_gwei=0.0,  # priced differently (per-signature lamports); handled in scanners.py
+        ),
+    })
     request_timeout_s: int = 10
     max_retries: int = 5
-    backoff_base_s: float = 0.5   # exponential backoff base
+    backoff_base_s: float = 0.5
     backoff_max_s: float = 20.0
 
+    def enabled_chains(self) -> List[ChainConfig]:
+        return [c for c in self.chains.values() if c.enabled]
+
 
 # --------------------------------------------------------------------------
-# Pool discovery / monitoring
+# Which scanners run, and how often
 # --------------------------------------------------------------------------
 
 @dataclass
-class PoolConfig:
-    # Which protocols to scan. Extend this list as adapters are added.
-    protocols: List[str] = field(default_factory=lambda: ["uniswap_v2", "uniswap_v3"])
+class ScannerToggle:
+    enabled: bool = True
+    poll_interval_s: float = 30.0
 
-    # Minimum pool TVL (in USD, approximate) to bother scanning.
-    # Filters out dead/illiquid pools that would just waste RPC calls.
+
+@dataclass
+class ScannersConfig:
+    cross_dex_arbitrage: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 3.0))
+    liquidation: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 10.0))
+    restaking: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 300.0))
+    bridge_watchtower: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 300.0))
+    liquidity_events: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 30.0))
+    new_pools: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 60.0))
+    smart_money: ScannerToggle = field(default_factory=lambda: ScannerToggle(False, 60.0))  # needs a wallet watchlist to be useful
+    incentive_programs: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 3600.0))
+    oracle_deviation: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 15.0))
+    governance_events: ScannerToggle = field(default_factory=lambda: ScannerToggle(True, 600.0))
+
+    # Wallets to watch for the smart-money scanner. Empty by default —
+    # this scanner is a no-op until the operator supplies addresses.
+    smart_money_watchlist: List[str] = field(default_factory=list)
+
+    # Minimum pool TVL (USD) before we bother tracking it at all.
     min_tvl_usd: float = 5_000.0
-
-    # How many top pools per token pair to track (by liquidity).
     max_pools_per_pair: int = 5
-
-    # Token pairs of interest. Empty list = discover all via subgraph.
-    # Format: list of (token0_symbol, token1_symbol) — resolved to
-    # addresses at runtime via the subgraph or a token list.
-    watched_pairs: List[tuple] = field(default_factory=list)
-
-    # Refresh interval for the subgraph-based discovery pass (seconds).
-    # This is separate from the RPC price polling loop, which runs much
-    # faster — discovery is "what pools exist", polling is "what's the
-    # price right now".
     discovery_interval_s: int = 300
+    price_staleness_s: float = 15.0
+    concurrent_rpc_calls: int = 20
 
 
 # --------------------------------------------------------------------------
-# Scanning loop
-# --------------------------------------------------------------------------
-
-@dataclass
-class ScanConfig:
-    poll_interval_s: float = 3.0        # how often to re-fetch prices via RPC
-    concurrent_rpc_calls: int = 20       # cap on simultaneous RPC requests
-    price_staleness_s: float = 15.0      # discard quotes older than this
-
-
-# --------------------------------------------------------------------------
-# Economics: fees, slippage, gas
+# Economics: fees, slippage, gas, profit thresholds
 # --------------------------------------------------------------------------
 
 @dataclass
 class EconomicsConfig:
-    # Flat-fee tiers by protocol/pool (in basis points). Real values should
-    # be read from the pool contract where possible (V3 pools expose fee());
-    # these are fallbacks/defaults.
     default_fee_bps: Dict[str, float] = field(default_factory=lambda: {
-        "uniswap_v2": 30.0,     # 0.30%
-        "uniswap_v3_500": 5.0,   # 0.05%
-        "uniswap_v3_3000": 30.0,  # 0.30%
-        "uniswap_v3_10000": 100.0,  # 1.00%
+        "uniswap_v2": 30.0,
+        "uniswap_v3_500": 5.0,
+        "uniswap_v3_3000": 30.0,
+        "uniswap_v3_10000": 100.0,
     })
 
-    # Assumed trade size(s) to simulate, in USD notional. The scanner
-    # checks profitability at each size since slippage is size-dependent.
     simulate_trade_sizes_usd: List[float] = field(
         default_factory=lambda: [500, 1_000, 5_000, 10_000, 25_000]
     )
 
-    # Max acceptable price impact per leg before we discard the size as
-    # unrealistic (protects against reporting phantom profit on sizes that
-    # would move the pool price too much to actually fill).
     max_price_impact_pct: float = 3.0
-
-    # Gas estimate assumptions (Base is cheap, but not free).
     assumed_gas_units_per_swap: int = 150_000
-    assumed_swaps_per_arb: int = 2      # buy + sell
-    gas_price_gwei_fallback: float = 0.05  # Base is typically sub-cent; fetched live when possible
-    native_token_usd_fallback: float = 3_000.0  # ETH/USD fallback if price feed fails
+    assumed_swaps_per_arb: int = 2
 
-    # Minimum net profit (after fees, slippage, and gas) to report, in USD.
-    # This is a report-only threshold; it does not gate execution because
-    # this tool does not execute trades.
+    # Minimum net profit (after fees, slippage, and gas) to REPORT, in USD.
+    # This is a report-only threshold — it does not gate execution because
+    # this tool does not execute anything. It just keeps the report from
+    # being flooded with noise-level "opportunities".
     min_net_profit_usd: float = 5.0
 
 
 # --------------------------------------------------------------------------
-# Logging / output
+# Risk filtering — deliberately cautious, not strict.
+# Nothing here silently deletes an opportunity from the report; it downgrades
+# confidence and attaches a reason. Only near-meaningless data (e.g. a price
+# with no liquidity context at all) gets excluded outright, because
+# reporting it would be misleading rather than merely risky.
+# --------------------------------------------------------------------------
+
+@dataclass
+class RiskConfig:
+    stale_data_penalty: float = 30.0          # confidence points deducted if data is borderline stale
+    thin_liquidity_usd_threshold: float = 20_000.0
+    thin_liquidity_penalty: float = 20.0
+    unverified_field_penalty: float = 15.0     # per missing/unverified numeric field
+    new_pool_age_s_threshold: float = 3600.0   # pools younger than this get a caution note
+    new_pool_penalty: float = 10.0
+    high_value_review_threshold_usd: float = 25_000.0  # above this, always flagged for manual review regardless of score
+
+
+# --------------------------------------------------------------------------
+# Output
 # --------------------------------------------------------------------------
 
 @dataclass
 class OutputConfig:
     log_level: str = "INFO"
-    log_file: str = "scanner.log"
+    log_file: str = "engine.log"
     csv_output_path: str = "opportunities.csv"
-    top_n_display: int = 10  # how many top opportunities to print per cycle
+    json_output_path: str = "opportunities.json"
+    top_n_display: int = 15
 
 
 # --------------------------------------------------------------------------
@@ -138,18 +185,19 @@ class OutputConfig:
 @dataclass
 class Config:
     network: NetworkConfig = field(default_factory=NetworkConfig)
-    pools: PoolConfig = field(default_factory=PoolConfig)
-    scan: ScanConfig = field(default_factory=ScanConfig)
+    scanners: ScannersConfig = field(default_factory=ScannersConfig)
     economics: EconomicsConfig = field(default_factory=EconomicsConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
 
 def load_config(path: str = "config.yaml") -> Config:
     """
     Load configuration, layering a local YAML file (if present) on top of
-    the dataclass defaults above. Environment variables (read at dataclass
-    construction time, e.g. BASE_RPC_URL) take precedence over YAML for
-    secrets like RPC URLs.
+    the dataclass defaults above. Env vars (read at dataclass construction
+    time, e.g. BASE_RPC_URL) take precedence over YAML for things like
+    RPC URLs. Unknown keys are logged and ignored rather than crashing —
+    a typo in config.yaml shouldn't take down the whole engine.
     """
     cfg = Config()
 
@@ -157,10 +205,10 @@ def load_config(path: str = "config.yaml") -> Config:
         with open(path, "r") as f:
             raw = yaml.safe_load(f) or {}
 
-        # Shallow-merge each section; this keeps the loader simple and
-        # explicit rather than doing deep recursive merging magic.
-        for section_name in ("network", "pools", "scan", "economics", "output"):
+        for section_name in ("network", "scanners", "economics", "risk", "output"):
             section_overrides = raw.get(section_name, {})
+            if not isinstance(section_overrides, dict):
+                continue
             section_obj = getattr(cfg, section_name)
             for key, value in section_overrides.items():
                 if hasattr(section_obj, key):
@@ -175,7 +223,6 @@ def load_config(path: str = "config.yaml") -> Config:
 
 
 def setup_logging(cfg: Config) -> None:
-    """Configure root logging based on OutputConfig."""
     logging.basicConfig(
         level=getattr(logging, cfg.output.log_level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -183,4 +230,4 @@ def setup_logging(cfg: Config) -> None:
             logging.StreamHandler(),
             logging.FileHandler(cfg.output.log_file),
         ],
-  )
+    )
