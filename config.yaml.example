@@ -1,0 +1,40 @@
+# config.yaml.example
+# Copy to config.yaml and fill in the addresses below.
+# Sources: book.onaave.com (Aave), data.chain.link (Chainlink),
+# docs.uniswap.org/contracts/v3/reference/deployments (Uniswap),
+# aerodrome.finance/security (Aerodrome on Base).
+# Leave any field blank to disable that scanner for that chain —
+# it will log a notice and skip cleanly rather than error.
+
+protocol_addresses:
+  base:
+    aave_pool: ""              # book.onaave.com -> Base -> POOL
+    uniswap_v3_factory: ""     # docs.uniswap.org deployments page, Base section
+    weth: "0x4200000000000000000000000000000000000006"
+    chainlink_eth_usd: ""      # data.chain.link, filter by Base
+    restaking_rewards: ""
+    bridge_watchtower: ""
+    governor: ""
+    incentive_feed_url: ""
+    liquidation_watchlist: []
+    restaking_watchlist: []
+
+  solana:
+    # Solana programs, not EVM contracts — addresses look different
+    # (base58, no 0x prefix). Source: each protocol's own docs
+    # (e.g. Raydium, Marinade, Kamino) or solscan.io verified programs.
+    aave_pool: ""               # N/A on Solana — leave blank
+    uniswap_v3_factory: ""      # N/A — Solana AMMs differ structurally (Raydium/Orca)
+    chainlink_eth_usd: ""
+    incentive_feed_url: ""
+    liquidation_watchlist: []
+    restaking_watchlist: []
+
+  arbitrum:
+    aave_pool: ""
+    uniswap_v3_factory: ""
+    weth: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+    chainlink_eth_usd: ""
+    incentive_feed_url: ""
+    liquidation_watchlist: []
+    restaking_watchlist: []
